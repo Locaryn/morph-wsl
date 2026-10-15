@@ -1,0 +1,117 @@
+name: Release Extension
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Vérifier la compilation
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --all-targets --locked
+      - name: Vérifier le manifeste
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e "JSON.parse(require('fs').readFileSync('morph.json','utf8'))"
+          node -e "JSON.parse(require('fs').readFileSync('mcp/mcp.json','utf8'))"
+          test -f SKILL.md
+
+  bundle:
+    name: Bundle ${{ matrix.label }}
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x86_64
+            runner: windows-latest
+          - label: windows-aarch64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.label }}
+      - name: Compiler le serveur MCP
+        run: cargo build --release --locked
+      - name: Assembler le paquet
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bundle
+          mkdir -p bundle/bin
+          cp morph.json SKILL.md README.md LICENSE bundle/
+          cp -r mcp bundle/
+          cp target/release/locaryn-wsl-mcp.exe bundle/bin/
+          test -f bundle/morph.json
+          test -f bundle/mcp/mcp.json
+          test -f bundle/bin/locaryn-wsl-mcp.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bundle-${{ matrix.label }}
+          path: bundle
+          if-no-files-found: error
+
+  release:
+    name: Publier la release
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bundle-*
+          path: dl
+      - name: Archiver
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' morph.json | head -n 1)"
+          test -n "$VERSION"
+          test "v$VERSION" = "${GITHUB_REF_NAME}"
+          mkdir -p out
+          for dir in dl/bundle-*; do
+            label="${dir#dl/bundle-}"
+            ( cd "$dir" && zip -r -q "$GITHUB_WORKSPACE/out/morph-wsl-v${VERSION}-${label}.zip" . )
+          done
+          ls -l out
+      - name: Vérifier les archives
+        run: |
+          set -euo pipefail
+          test "$(ls out/*.zip | wc -l)" -eq 2
+          for archive in out/*.zip; do
+            unzip -l "$archive" | grep -q "morph.json"
+            unzip -l "$archive" | grep -q "mcp/mcp.json"
+            unzip -l "$archive" | grep -q "bin/locaryn-wsl-mcp.exe"
+          done
+      - name: Empreintes SHA-256
+        run: |
+          set -euo pipefail
+          ( cd out && sha256sum *.zip | tee SHA256SUMS.txt )
+      - uses: softprops/action-gh-release@v3
+        with:
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          name: "morph-wsl ${{ github.ref_name }}"
+          files: out/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

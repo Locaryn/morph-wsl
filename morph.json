@@ -1,0 +1,56 @@
+{
+  "$schema": "https://locaryn.dev/schema/morph.json/v0.1",
+  "apiVersion": "0.1",
+  "name": "morph-wsl",
+  "displayName": "WSL",
+  "version": "0.1.0-beta.1",
+  "description": "Donne au modèle l'accès à vos distributions WSL (Ubuntu, Debian…) : exécuter des commandes bash, lire et écrire des fichiers Linux, parcourir les dossiers, convertir les chemins entre Windows et Linux. Les commandes destructrices et l'exécution en root attendent votre accord.",
+  "author": "Locaryn Team",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/Locaryn/morph-wsl",
+  "repository": "https://github.com/Locaryn/morph-wsl",
+  "keywords": [
+    "wsl",
+    "linux",
+    "ubuntu",
+    "bash",
+    "shell",
+    "windows"
+  ],
+  "permissions": {
+    "mcp": {
+      "reason": "Lancer le serveur WSL fourni par l'extension."
+    },
+    "shell": {
+      "reason": "Exécuter dans WSL les commandes que vous demandez au modèle ; les commandes destructrices et l'exécution en root demandent confirmation.",
+      "requireApproval": true
+    },
+    "files.read": {
+      "reason": "Lire les fichiers des distributions WSL."
+    },
+    "files.write": {
+      "reason": "Écrire les fichiers que vous demandez dans les distributions WSL."
+    }
+  },
+  "components": {
+    "skills": [
+      "SKILL.md"
+    ],
+    "mcp": "mcp/mcp.json"
+  },
+  "platforms": [
+    "windows"
+  ],
+  "beta": true,
+  "stability": "untested",
+  "versions": [
+    {
+      "version": "0.1.0-beta.1",
+      "is_beta": true,
+      "summary": "Première version : commandes bash, lecture et écriture de fichiers, liste de dossiers et conversion de chemins dans toutes les distributions WSL ; Windows x64 et ARM64",
+      "tag": "v0.1.0-beta.1",
+      "released_at": "2026-10-15",
+      "install_source": "Locaryn/morph-wsl#v0.1.0-beta.1"
+    }
+  ]
+}

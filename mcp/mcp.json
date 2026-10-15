@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "wsl": {
+      "command": "${LOCARYN_MORPH_ROOT}/bin/locaryn-wsl-mcp.exe",
+      "args": [],
+      "env": {},
+      "transport": "stdio",
+      "auto_start": true
+    }
+  }
+}
