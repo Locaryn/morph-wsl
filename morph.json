@@ -59,7 +59,7 @@
     {
       "version": "0.1.0-beta.3",
       "is_beta": true,
-      "summary": "Mot de passe sudo par distribution, rangé dans le coffre de Locaryn (trousseau du système) : saisi une fois dans les réglages ou à la demande du modèle, utilisé sans qu'il le voie",
+      "summary": "Programmes interactifs (wsl_start, wsl_send, wsl_read, wsl_stop) dans un pseudo-terminal ; sortie des commandes suivie en direct dans Locaryn ; mot de passe sudo par distribution rangé dans le coffre de Locaryn, utilisé sans que le modèle le voie",
       "tag": "v0.1.0-beta.3",
       "released_at": "2026-10-16",
       "install_source": "Locaryn/morph-wsl#v0.1.0-beta.3"

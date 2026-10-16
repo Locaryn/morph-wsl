@@ -26,6 +26,33 @@ pub fn str_prop(desc: &str) -> Value {
     json!({ "type": "string", "description": desc })
 }
 
+/// Le jeton d'avancement de l'appel en cours (`_meta.progressToken`), quand
+/// Locaryn suit l'appel : la sortie d'une commande lui est alors envoyée au
+/// fil de l'eau. Les appels sont traités un par un : un seul jeton à la fois.
+static JETON: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+static RANG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Envoyer un morceau de sortie à Locaryn pendant l'appel en cours.
+pub fn progres(message: &str) {
+    if message.is_empty() {
+        return;
+    }
+    let Some(jeton) = JETON.lock().ok().and_then(|j| j.clone()) else {
+        return;
+    };
+    let rang = RANG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": { "progressToken": jeton, "progress": rang, "message": message }
+    });
+    if let Ok(ligne) = serde_json::to_string(&notification) {
+        let mut sortie = std::io::stdout().lock();
+        let _ = writeln!(sortie, "{ligne}");
+        let _ = sortie.flush();
+    }
+}
+
 fn success(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
@@ -101,7 +128,14 @@ where
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match call(name, args).await {
+            if let Ok(mut j) = JETON.lock() {
+                *j = params.pointer("/_meta/progressToken").cloned();
+            }
+            let resultat = call(name, args).await;
+            if let Ok(mut j) = JETON.lock() {
+                *j = None;
+            }
+            match resultat {
                 Ok(value) => success(id, text_content(&value)),
                 Err(error) => error_response(id, -32000, error),
             }

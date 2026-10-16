@@ -77,6 +77,46 @@ pub fn tools_list() -> Value {
             }),
             &["command"],
         ),
+        tool(
+            "wsl_start",
+            "Lance un programme interactif (script qui pose des questions, installateur « [Y/n] », REPL, assistant de configuration) dans un pseudo-terminal WSL, et rend la main dès qu'il attend une entrée — sans bloquer jusqu'à la fin. Rend un identifiant de session : répondez avec wsl_send, relisez avec wsl_read, arrêtez avec wsl_stop. Pour une commande qui ne demande rien, wsl_run suffit.",
+            json!({
+                "command": str_prop("Commande à lancer"),
+                "distro": distro(),
+                "cwd": str_prop("Dossier de travail (défaut : ~)"),
+                "as_root": root(),
+                "sudo_password": str_prop("Si la commande utilise sudo : {{secret:wsl-sudo-<distro>}}, jamais le mot de passe lui-même."),
+                "wait_s": { "type": "integer", "description": "Attente maximale avant de rendre la main (défaut 5 s, max 120). Rend plus tôt si le programme se tait." },
+            }),
+            &["command"],
+        ),
+        tool(
+            "wsl_send",
+            "Écrit une réponse au programme d'une session (wsl_start), puis rend ce qu'il affiche ensuite. Entrée ajoutée par défaut. Un mot de passe demandé par le programme : input = {{secret:nom}} (voir ask_secret), jamais en clair.",
+            json!({
+                "session": str_prop("Identifiant rendu par wsl_start"),
+                "input": str_prop("Texte à taper (ex. « y », « 2 », un nom)"),
+                "enter": { "type": "boolean", "description": "Appuyer sur Entrée après (défaut true)" },
+                "ctrl_c": { "type": "boolean", "description": "Envoyer Ctrl+C au lieu d'un texte" },
+                "wait_s": { "type": "integer", "description": "Attente maximale (défaut 5 s)" },
+            }),
+            &["session"],
+        ),
+        annote(tool(
+            "wsl_read",
+            "Relit ce que le programme d'une session a affiché depuis la dernière lecture (il travaille encore, ou il a fini).",
+            json!({
+                "session": str_prop("Identifiant rendu par wsl_start"),
+                "wait_s": { "type": "integer", "description": "Attente maximale de nouvelle sortie (défaut 5 s)" },
+            }),
+            &["session"],
+        ), lecture.clone()),
+        tool(
+            "wsl_stop",
+            "Arrête le programme d'une session et rend sa dernière sortie.",
+            json!({ "session": str_prop("Identifiant rendu par wsl_start") }),
+            &["session"],
+        ),
         annote(tool(
             "wsl_read_file",
             "Lit un fichier texte d'une distribution WSL (chemin Linux, relatif à ~ s'il ne commence pas par /).",
@@ -167,6 +207,10 @@ pub async fn call(name: &str, args: Value) -> Result<Value, String> {
     match name {
         "wsl_distros" => distros().await,
         "wsl_run" => run(&args).await,
+        "wsl_start" => crate::sessions::start(&args).await,
+        "wsl_send" => crate::sessions::send(&args).await,
+        "wsl_read" => crate::sessions::read(&args).await,
+        "wsl_stop" => crate::sessions::stop(&args).await,
         "wsl_read_file" => read_file(&args).await,
         "wsl_write_file" => write_file(&args).await,
         "wsl_edit_file" => edit_file(&args).await,
@@ -206,6 +250,14 @@ pub fn catastrophique(commande: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|motif| bas.contains(motif))
+}
+
+/// La sortie en direct sans les avis de WSL lui-même (« wsl: Failed to start
+/// the systemd user session… ») : ils ne viennent pas de la commande.
+pub fn sans_avis_wsl(t: &str) -> String {
+    t.split_inclusive('\n')
+        .filter(|l| !l.starts_with("wsl: "))
+        .collect()
 }
 
 /// Valider sudo une fois avec le mot de passe lu sur l'entrée standard, puis
@@ -275,8 +327,16 @@ async fn run(args: &Value) -> Result<Value, String> {
     let (commande, entree) = match mot_de_passe {
         Some(p) if utilise_sudo(commande) => {
             avec_sudo = prefixe_sudo(commande);
-            (avec_sudo.as_str(), Some(format!("{p}
-").into_bytes()))
+            (
+                avec_sudo.as_str(),
+                Some(
+                    format!(
+                        "{p}
+"
+                    )
+                    .into_bytes(),
+                ),
+            )
         }
         _ => (commande, None),
     };
@@ -292,7 +352,16 @@ async fn run(args: &Value) -> Result<Value, String> {
             "timeout", "-k", "5", &secondes, "sh", "-c", lanceur, "locaryn", commande,
         ],
     );
-    let s = wsl::wsl(&a, entree.as_deref(), Duration::from_secs(delai) + MARGE_DEMARRAGE).await?;
+    // La sortie part à Locaryn pendant que la commande tourne (mise à jour,
+    // compilation) : la carte d'outil la montre en direct.
+    let en_direct = |t: &str| crate::mcp::progres(&sans_avis_wsl(t));
+    let s = wsl::wsl_suivi(
+        &a,
+        entree.as_deref(),
+        Duration::from_secs(delai) + MARGE_DEMARRAGE,
+        Some(&en_direct),
+    )
+    .await?;
     let (stderr, avis) = separer_avis_wsl(&decode(&s.stderr));
     let mut r = json!({
         "distro": distro,

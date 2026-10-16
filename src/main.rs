@@ -2,6 +2,7 @@
 //! distributions Linux de l'utilisateur (commandes, fichiers, chemins).
 
 mod mcp;
+mod sessions;
 mod tools;
 mod wsl;
 

@@ -51,6 +51,34 @@ pub async fn wsl(
     entree: Option<&[u8]>,
     delai: Duration,
 ) -> Result<Sortie, String> {
+    wsl_suivi(args, entree, delai, None).await
+}
+
+/// Ce qui reçoit la sortie au fil de l'eau.
+pub type Suivi<'a> = Option<&'a (dyn Fn(&str) + Sync)>;
+
+/// Prendre dans `attente` ce qui forme de l'UTF-8 complet, et garder la fin
+/// d'un caractère coupé entre deux lectures pour la suivante.
+pub fn prendre_utf8(attente: &mut Vec<u8>) -> String {
+    let complet = match std::str::from_utf8(attente) {
+        Ok(_) => attente.len(),
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        Err(_) => attente.len(),
+    };
+    let reste = attente.split_off(complet);
+    let texte = String::from_utf8_lossy(attente).into_owned();
+    *attente = reste;
+    texte
+}
+
+/// Comme [`wsl`], en passant la sortie à `suivi` pendant que la commande
+/// tourne (quelques fois par seconde) : une mise à jour se suit en direct.
+pub async fn wsl_suivi(
+    args: &[String],
+    entree: Option<&[u8]>,
+    delai: Duration,
+    suivi: Suivi<'_>,
+) -> Result<Sortie, String> {
     let mut cmd = tokio::process::Command::new("wsl.exe");
     cmd.args(args)
         .env("WSL_UTF8", "1")
@@ -76,13 +104,58 @@ pub async fn wsl(
             drop(stdin);
         });
     }
-    let mut out = enfant.stdout.take().ok_or("stdout indisponible")?;
-    let mut err = enfant.stderr.take().ok_or("stderr indisponible")?;
+    let out = enfant.stdout.take().ok_or("stdout indisponible")?;
+    let err = enfant.stderr.take().ok_or("stderr indisponible")?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(bool, Vec<u8>)>();
+    for (est_err, mut flux) in [
+        (
+            false,
+            Box::new(out) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        ),
+        (true, Box::new(err)),
+    ] {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut tampon = [0u8; 8192];
+            while let Ok(n) = flux.read(&mut tampon).await {
+                if n == 0 || tx.send((est_err, tampon[..n].to_vec())).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
     let lecture = async {
         let (mut o, mut e) = (Vec::new(), Vec::new());
-        let (ro, re) = tokio::join!(out.read_to_end(&mut o), err.read_to_end(&mut e));
-        ro.and(re)
-            .map_err(|x| format!("lecture de la sortie : {x}"))?;
+        let mut attente: Vec<u8> = Vec::new();
+        let mut cadence = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            tokio::select! {
+                morceau = rx.recv() => match morceau {
+                    Some((est_err, octets)) => {
+                        if suivi.is_some() {
+                            attente.extend_from_slice(&octets);
+                        }
+                        if est_err { e.extend(octets) } else { o.extend(octets) }
+                    }
+                    None => break,
+                },
+                _ = cadence.tick() => {
+                    if let Some(f) = suivi {
+                        let texte = prendre_utf8(&mut attente);
+                        if !texte.is_empty() {
+                            f(&texte);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(f) = suivi {
+            let texte = String::from_utf8_lossy(&attente).into_owned();
+            if !texte.is_empty() {
+                f(&texte);
+            }
+        }
         let statut = enfant.wait().await.map_err(|x| format!("attente : {x}"))?;
         Ok::<_, String>(Sortie {
             code: statut.code(),
@@ -201,6 +274,16 @@ mod tests {
         assert_eq!(liste[1].state, "Running");
         assert!(!liste[1].default);
         assert_eq!(liste[2].version, 1);
+    }
+
+    #[test]
+    fn un_caractere_coupe_attend_la_lecture_suivante() {
+        let mut a = "é".as_bytes()[..1].to_vec();
+        assert_eq!(prendre_utf8(&mut a), "");
+        a.extend_from_slice(&"é".as_bytes()[1..]);
+        a.extend_from_slice(b" ok");
+        assert_eq!(prendre_utf8(&mut a), "é ok");
+        assert!(a.is_empty());
     }
 
     #[test]
