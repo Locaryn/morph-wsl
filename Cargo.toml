@@ -1,6 +1,6 @@
 [package]
 name = "locaryn-morph-wsl"
-version = "0.1.0-beta.3"
+version = "0.1.0-beta.4"
 edition = "2021"
 description = "Morph Locaryn : donne au modèle l'accès aux distributions WSL (commandes, fichiers, chemins)"
 license = "Apache-2.0"

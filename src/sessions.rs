@@ -330,11 +330,48 @@ fn rand_id() -> String {
     format!("{:x}{}", t & 0xffff, N.fetch_add(1, Ordering::Relaxed) + 1)
 }
 
+/// Une touche nommée en sa séquence pour le terminal : flèches, espace,
+/// tabulation… — de quoi cocher une case dans un menu `whiptail`/`dialog`
+/// (flèches pour se déplacer, espace pour (dé)cocher, tab vers OK, entrée).
+fn touche_vers_octets(nom: &str) -> Option<&'static [u8]> {
+    Some(match nom.trim().to_ascii_lowercase().as_str() {
+        "up" | "haut" => b"\x1b[A",
+        "down" | "bas" => b"\x1b[B",
+        "right" | "droite" => b"\x1b[C",
+        "left" | "gauche" => b"\x1b[D",
+        "space" | "espace" => b" ",
+        "tab" => b"\t",
+        // La touche Entrée, c'est le retour chariot : un menu whiptail/dialog
+        // en mode brut n'attend que lui. En mode ligne (read -p), le terminal
+        // le convertit en saut de ligne — il marche donc dans les deux cas.
+        "enter" | "return" | "entree" | "entr\u{e9}e" => b"\r",
+        "esc" | "escape" | "echap" => b"\x1b",
+        "backspace" | "retour" => b"\x7f",
+        "home" => b"\x1b[H",
+        "end" | "fin" => b"\x1b[F",
+        "pageup" => b"\x1b[5~",
+        "pagedown" => b"\x1b[6~",
+        "ctrl-c" | "ctrl_c" => b"\x03",
+        _ => return None,
+    })
+}
+
 pub async fn send(args: &Value) -> Result<Value, String> {
     let id = texte(args, "session").ok_or("session est obligatoire (rendue par wsl_start)")?;
     let mut octets: Vec<u8> = Vec::new();
     if args["ctrl_c"] == json!(true) {
         octets.push(0x03);
+    } else if let Some(touches) = args.get("keys").and_then(Value::as_array) {
+        // Une suite de touches : naviguer dans un menu (flèches, espace, tab…).
+        for t in touches {
+            let Some(nom) = t.as_str() else { continue };
+            match touche_vers_octets(nom) {
+                Some(seq) => octets.extend_from_slice(seq),
+                None => return Err(format!(
+                    "touche inconnue « {nom} » : up, down, left, right, space, tab, enter, esc, backspace, home, end, pageup, pagedown"
+                )),
+            }
+        }
     } else {
         let saisie = texte(args, "input").unwrap_or("");
         if saisie.contains("{{secret:") {
@@ -342,7 +379,9 @@ pub async fn send(args: &Value) -> Result<Value, String> {
         }
         octets.extend_from_slice(saisie.as_bytes());
         if args["enter"] != json!(false) {
-            octets.push(b'\n');
+            // Retour chariot : Entrée pour un programme en mode brut (TUI) comme
+            // en mode ligne (read -p, que le terminal convertit en saut de ligne).
+            octets.push(b'\r');
         }
     }
     {
@@ -380,6 +419,14 @@ pub async fn stop(args: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::nettoyer;
+
+    #[test]
+    fn les_touches_de_navigation_deviennent_des_sequences() {
+        assert_eq!(super::touche_vers_octets("down"), Some(&b"\x1b[B"[..]));
+        assert_eq!(super::touche_vers_octets("space"), Some(&b" "[..]));
+        assert_eq!(super::touche_vers_octets("Tab"), Some(&b"\t"[..]));
+        assert!(super::touche_vers_octets("f13").is_none());
+    }
 
     #[test]
     fn la_sortie_d_un_terminal_devient_du_texte() {

@@ -92,11 +92,16 @@ pub fn tools_list() -> Value {
         ),
         tool(
             "wsl_send",
-            "Écrit une réponse au programme d'une session (wsl_start), puis rend ce qu'il affiche ensuite. Entrée ajoutée par défaut. Un mot de passe demandé par le programme : input = {{secret:nom}} (voir ask_secret), jamais en clair.",
+            "Répond au programme d'une session (wsl_start), puis rend ce qu'il affiche ensuite. Soit du texte (input, Entrée ajoutée par défaut), soit une suite de touches (keys) pour un menu en plein écran whiptail/dialog : flèches pour se déplacer, « space » pour cocher/décocher une case, « tab » pour aller sur OK, « enter » pour valider. Un mot de passe demandé par le programme : input = {{secret:nom}} (voir ask_secret), jamais en clair.",
             json!({
                 "session": str_prop("Identifiant rendu par wsl_start"),
-                "input": str_prop("Texte à taper (ex. « y », « 2 », un nom)"),
-                "enter": { "type": "boolean", "description": "Appuyer sur Entrée après (défaut true)" },
+                "input": str_prop("Texte à taper (ex. « y », « 2 », un nom). Ignoré si keys est fourni."),
+                "keys": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Suite de touches pour un menu : up, down, left, right, space, tab, enter, esc, backspace, home, end, pageup, pagedown. Ex. cocher la 2e case puis valider : [\"down\",\"space\",\"tab\",\"enter\"]."
+                },
+                "enter": { "type": "boolean", "description": "Appuyer sur Entrée après le texte (défaut true). Sans effet avec keys." },
                 "ctrl_c": { "type": "boolean", "description": "Envoyer Ctrl+C au lieu d'un texte" },
                 "wait_s": { "type": "integer", "description": "Attente maximale (défaut 5 s)" },
             }),
