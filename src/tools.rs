@@ -66,13 +66,14 @@ pub fn tools_list() -> Value {
         ), lecture.clone()),
         tool(
             "wsl_run",
-            "Exécute une commande bash dans une distribution WSL, en tant que l'utilisateur, et rend sa sortie (code, stdout, stderr). Non interactive : utilisez -y, --no-pager… Si sudo demande un mot de passe, voir wsl_allow_sudo.",
+            "Exécute une commande bash dans une distribution WSL, en tant que l'utilisateur, et rend sa sortie (code, stdout, stderr). Non interactive : utilisez -y, --no-pager… Si sudo demande un mot de passe : sudo_password = {{secret:wsl-sudo-<distro>}} (le mot de passe vient du coffre de Locaryn, vous ne le voyez jamais), ou wsl_allow_sudo.",
             json!({
                 "command": str_prop("Commande bash"),
                 "distro": distro(),
                 "cwd": str_prop("Dossier de travail : chemin Linux (/home/…, ~/projet) ou Windows (C:\\…). Défaut : ~"),
                 "timeout_s": { "type": "integer", "description": "Délai en secondes (défaut 120, max 1800)" },
                 "as_root": root(),
+                "sudo_password": str_prop("Mot de passe sudo : écrivez exactement {{secret:wsl-sudo-<distro>}}, jamais le mot de passe lui-même — Locaryn y met la valeur du coffre. Pas encore dans le coffre : demandez-le avec ask_secret (name=\"wsl-sudo-<distro>\")."),
             }),
             &["command"],
         ),
@@ -207,6 +208,13 @@ pub fn catastrophique(commande: &str) -> Option<&'static str> {
         .find(|motif| bas.contains(motif))
 }
 
+/// Valider sudo une fois avec le mot de passe lu sur l'entrée standard, puis
+/// lancer la commande : ses `sudo` profitent de l'autorisation fraîche, sans
+/// rien lire de plus.
+pub fn prefixe_sudo(commande: &str) -> String {
+    format!("sudo -S -p '' -v >/dev/null 2>&1; {commande}")
+}
+
 /// La commande appelle-t-elle sudo (en début de mot) ?
 pub fn utilise_sudo(commande: &str) -> bool {
     commande
@@ -256,6 +264,22 @@ async fn run(args: &Value) -> Result<Value, String> {
         .unwrap_or(DELAI_DEFAUT_S)
         .clamp(1, DELAI_MAX_S);
     let secondes = delai.to_string();
+    // Le mot de passe sudo, mis par Locaryn à la place de {{secret:…}} :
+    // il passe par l'entrée standard (`sudo -S`), jamais par la ligne de
+    // commande — `ps` ne le montre pas, la sortie ne le contient pas.
+    let mot_de_passe = texte(args, "sudo_password").filter(|p| !p.is_empty());
+    if mot_de_passe.is_some_and(|p| p.contains("{{secret:")) {
+        return Err("sudo_password n'a pas été rempli par le coffre : mettez Locaryn à jour (0.4.40 ou plus), ou utilisez wsl_allow_sudo.".into());
+    }
+    let avec_sudo;
+    let (commande, entree) = match mot_de_passe {
+        Some(p) if utilise_sudo(commande) => {
+            avec_sudo = prefixe_sudo(commande);
+            (avec_sudo.as_str(), Some(format!("{p}
+").into_bytes()))
+        }
+        _ => (commande, None),
+    };
     // bash de connexion pour retrouver le PATH de l'utilisateur (nvm, cargo,
     // pyenv…) ; sh sur les distributions sans bash (Alpine).
     let lanceur =
@@ -268,7 +292,7 @@ async fn run(args: &Value) -> Result<Value, String> {
             "timeout", "-k", "5", &secondes, "sh", "-c", lanceur, "locaryn", commande,
         ],
     );
-    let s = wsl::wsl(&a, None, Duration::from_secs(delai) + MARGE_DEMARRAGE).await?;
+    let s = wsl::wsl(&a, entree.as_deref(), Duration::from_secs(delai) + MARGE_DEMARRAGE).await?;
     let (stderr, avis) = separer_avis_wsl(&decode(&s.stderr));
     let mut r = json!({
         "distro": distro,
@@ -285,7 +309,11 @@ async fn run(args: &Value) -> Result<Value, String> {
             || stderr.contains("a password is required")
             || stderr.contains("password for"))
     {
-        r["note"] = json!("sudo demande un mot de passe, impossible à saisir ici. Proposez à l'utilisateur d'autoriser sudo sans mot de passe (wsl_allow_sudo, avec son accord), ou relancez cette commande sans sudo avec as_root=true.");
+        r["note"] = json!(if entree.is_some() {
+            format!("sudo a refusé le mot de passe du coffre. Redemandez-le avec ask_secret (name=\"wsl-sudo-{distro}\", replace=true), puis relancez.")
+        } else {
+            format!("sudo demande un mot de passe. Relancez avec sudo_password = {{{{secret:wsl-sudo-{distro}}}}} (s'il n'est pas encore dans le coffre, ask_secret le fait saisir à l'utilisateur sans que vous le voyiez), ou proposez wsl_allow_sudo, ou as_root=true.")
+        });
     }
     if s.code == Some(124) {
         r["timed_out"] = json!(true);
@@ -672,6 +700,13 @@ async fn path(args: &Value) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn le_mot_de_passe_sudo_passe_par_l_entree_et_jamais_par_la_commande() {
+        let c = super::prefixe_sudo("sudo apt update");
+        assert_eq!(c, "sudo -S -p '' -v >/dev/null 2>&1; sudo apt update");
+        assert!(!c.contains("{{secret"));
+    }
+
     use super::*;
 
     #[test]

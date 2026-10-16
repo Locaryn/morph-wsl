@@ -3,7 +3,7 @@
   "apiVersion": "0.1",
   "name": "morph-wsl",
   "displayName": "WSL",
-  "version": "0.1.0-beta.2",
+  "version": "0.1.0-beta.3",
   "description": "Donne au modèle l'accès à vos distributions WSL (Ubuntu, Debian…) : exécuter des commandes bash (sudo compris), créer, modifier, déplacer et supprimer des fichiers Linux, parcourir les dossiers, convertir les chemins entre Windows et Linux. Seules les commandes qui détruiraient le système sont bloquées ; le reste passe par l'approbation de Locaryn.",
   "author": "Locaryn Team",
   "license": "Apache-2.0",
@@ -32,6 +32,18 @@
       "reason": "Écrire les fichiers que vous demandez dans les distributions WSL."
     }
   },
+  "secrets": [
+    {
+      "name": "wsl-sudo-{name}",
+      "title": "Mot de passe sudo",
+      "description": "Le mot de passe de votre utilisateur dans la distribution, pour sudo. Le modèle s'en sert sans le voir.",
+      "variants": {
+        "tool": "wsl_distros",
+        "list": "distros",
+        "field": "name"
+      }
+    }
+  ],
   "components": {
     "skills": [
       "SKILL.md"
@@ -44,6 +56,14 @@
   "beta": true,
   "stability": "untested",
   "versions": [
+    {
+      "version": "0.1.0-beta.3",
+      "is_beta": true,
+      "summary": "Mot de passe sudo par distribution, rangé dans le coffre de Locaryn (trousseau du système) : saisi une fois dans les réglages ou à la demande du modèle, utilisé sans qu'il le voie",
+      "tag": "v0.1.0-beta.3",
+      "released_at": "2026-10-16",
+      "install_source": "Locaryn/morph-wsl#v0.1.0-beta.3"
+    },
     {
       "version": "0.1.0-beta.2",
       "is_beta": true,
