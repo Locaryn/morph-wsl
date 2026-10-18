@@ -3,7 +3,7 @@
   "apiVersion": "0.1",
   "name": "morph-wsl",
   "displayName": "WSL",
-  "version": "0.1.0-beta.4",
+  "version": "0.1.0-beta.5",
   "description": "Donne au modèle l'accès à vos distributions WSL (Ubuntu, Debian…) : exécuter des commandes bash (sudo compris), créer, modifier, déplacer et supprimer des fichiers Linux, parcourir les dossiers, convertir les chemins entre Windows et Linux. Seules les commandes qui détruiraient le système sont bloquées ; le reste passe par l'approbation de Locaryn.",
   "author": "Locaryn Team",
   "license": "Apache-2.0",
@@ -56,6 +56,14 @@
   "beta": true,
   "stability": "untested",
   "versions": [
+    {
+      "version": "0.1.0-beta.5",
+      "is_beta": true,
+      "summary": "Une commande qui demande une interaction (question [Y/n], menu, mot de passe) ne bloque plus jusqu'au délai : wsl_run rend la main avec un identifiant de session, poursuivable par wsl_send ; la sortie en direct et le résultat sont débarrassés des codes terminal",
+      "tag": "v0.1.0-beta.5",
+      "released_at": "2026-10-18",
+      "install_source": "Locaryn/morph-wsl#v0.1.0-beta.5"
+    },
     {
       "version": "0.1.0-beta.4",
       "is_beta": true,

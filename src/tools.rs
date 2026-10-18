@@ -66,7 +66,7 @@ pub fn tools_list() -> Value {
         ), lecture.clone()),
         tool(
             "wsl_run",
-            "Exécute une commande bash dans une distribution WSL, en tant que l'utilisateur, et rend sa sortie (code, stdout, stderr). Non interactive : utilisez -y, --no-pager… Si sudo demande un mot de passe : sudo_password = {{secret:wsl-sudo-<distro>}} (le mot de passe vient du coffre de Locaryn, vous ne le voyez jamais), ou wsl_allow_sudo.",
+            "Exécute une commande bash dans une distribution WSL, en tant que l'utilisateur, et rend sa sortie (code, stdout, stderr). Si la commande se met à attendre une réponse (question [Y/n], menu, mot de passe), la main vous est rendue avec un identifiant de session : répondez par wsl_send, relisez par wsl_read. Préférez malgré tout -y, --no-pager, DEBIAN_FRONTEND=noninteractive. Si sudo demande un mot de passe : sudo_password = {{secret:wsl-sudo-<distro>}} (le mot de passe vient du coffre de Locaryn, vous ne le voyez jamais), ou wsl_allow_sudo.",
             json!({
                 "command": str_prop("Commande bash"),
                 "distro": distro(),
@@ -320,82 +320,134 @@ async fn run(args: &Value) -> Result<Value, String> {
         .as_u64()
         .unwrap_or(DELAI_DEFAUT_S)
         .clamp(1, DELAI_MAX_S);
-    let secondes = delai.to_string();
-    // Le mot de passe sudo, mis par Locaryn à la place de {{secret:…}} :
-    // il passe par l'entrée standard (`sudo -S`), jamais par la ligne de
-    // commande — `ps` ne le montre pas, la sortie ne le contient pas.
-    let mot_de_passe = texte(args, "sudo_password").filter(|p| !p.is_empty());
-    if mot_de_passe.is_some_and(|p| p.contains("{{secret:")) {
-        return Err("sudo_password n'a pas été rempli par le coffre : mettez Locaryn à jour (0.4.40 ou plus), ou utilisez wsl_allow_sudo.".into());
-    }
-    let avec_sudo;
-    let (commande, entree) = match mot_de_passe {
-        Some(p) if utilise_sudo(commande) => {
-            avec_sudo = prefixe_sudo(commande);
-            (
-                avec_sudo.as_str(),
-                Some(
-                    format!(
-                        "{p}
-"
-                    )
-                    .into_bytes(),
-                ),
-            )
-        }
-        _ => (commande, None),
-    };
-    // bash de connexion pour retrouver le PATH de l'utilisateur (nvm, cargo,
-    // pyenv…) ; sh sur les distributions sans bash (Alpine).
-    let lanceur =
-        r#"if command -v bash >/dev/null 2>&1; then exec bash -lc "$1"; else exec sh -lc "$1"; fi"#;
-    let a = exec_args(
-        &distro,
+    let avec_mdp = texte(args, "sudo_password").is_some_and(|p| !p.is_empty());
+    // Le pseudo-terminal (le même que wsl_start) est ce qui rend les
+    // invitations lisibles et répondables ; la commande reste bornée par
+    // `timeout -k 5` côté WSL, comme avant. Le mot de passe sudo, mis par
+    // Locaryn à la place de {{secret:…}}, part par l'entrée standard du
+    // pseudo-terminal — jamais dans la ligne de commande.
+    let id = crate::sessions::lancer(
+        commande,
+        distro.clone(),
         dossier.as_deref(),
         root,
-        &[
-            "timeout", "-k", "5", &secondes, "sh", "-c", lanceur, "locaryn", commande,
-        ],
-    );
-    // La sortie part à Locaryn pendant que la commande tourne (mise à jour,
-    // compilation) : la carte d'outil la montre en direct.
-    let en_direct = |t: &str| crate::mcp::progres(&sans_avis_wsl(t));
-    let s = wsl::wsl_suivi(
-        &a,
-        entree.as_deref(),
-        Duration::from_secs(delai) + MARGE_DEMARRAGE,
-        Some(&en_direct),
+        texte(args, "sudo_password")
+            .filter(|p| !p.is_empty())
+            .map(str::to_string),
+        delai,
     )
     .await?;
-    let (stderr, avis) = separer_avis_wsl(&decode(&s.stderr));
-    let mut r = json!({
+    let (r, fin) = crate::sessions::attendre_avec(
+        &id,
+        Duration::from_secs(delai) + MARGE_DEMARRAGE,
+        Some(&semble_invite),
+    )
+    .await?;
+    let sortie = r["output"].as_str().unwrap_or_default().to_string();
+    let mut rep = json!({
         "distro": distro,
-        "exit_code": s.code,
         "as_root": root,
-        "stdout": tronque(&decode(&s.stdout)),
-        "stderr": tronque(&stderr),
+        "stdout": &sortie,
+        // Le pseudo-terminal mêle stdout et stderr : tout arrive dans
+        // `stdout`, comme dans une console.
+        "stderr": "",
     });
-    if !avis.is_empty() {
-        r["wsl_notice"] = json!(avis.join("\n"));
+    if let Some(avis) = r.get("wsl_notice") {
+        rep["wsl_notice"] = avis.clone();
     }
-    if utilise_sudo(commande)
-        && (stderr.contains("a terminal is required")
-            || stderr.contains("a password is required")
-            || stderr.contains("password for"))
-    {
-        r["note"] = json!(if entree.is_some() {
-            format!("sudo a refusé le mot de passe du coffre. Redemandez-le avec ask_secret (name=\"wsl-sudo-{distro}\", replace=true), puis relancez.")
-        } else {
-            format!("sudo demande un mot de passe. Relancez avec sudo_password = {{{{secret:wsl-sudo-{distro}}}}} (s'il n'est pas encore dans le coffre, ask_secret le fait saisir à l'utilisateur sans que vous le voyiez), ou proposez wsl_allow_sudo, ou as_root=true.")
-        });
+    match fin {
+        crate::sessions::FinAtteinte::Terminee => {
+            rep["exit_code"] = r.get("exit_code").cloned().unwrap_or(Value::Null);
+            if rep["exit_code"] == json!(124) {
+                rep["timed_out"] = json!(true);
+                rep["note"] = json!(format!(
+                    "Commande interrompue après {delai} s. Pour un serveur ou une tâche longue : `setsid nohup … > ~/journal.log 2>&1 &` puis lisez le journal."
+                ));
+            }
+        }
+        crate::sessions::FinAtteinte::Invite => {
+            // La commande attend une réponse : on rend la main tout en la
+            // laissant vivre — le modèle y répond par wsl_send au lieu de
+            // garder wsl_run bloqué jusqu'au délai.
+            rep["running"] = json!(true);
+            rep["session"] = json!(id);
+            let bas = sortie.to_lowercase();
+            let mdp_demande = utilise_sudo(commande)
+                && !avec_mdp
+                && (bas.contains("password for")
+                    || bas.contains("a terminal is required")
+                    || bas.contains("a password is required"));
+            rep["note"] = json!(if mdp_demande {
+                format!("sudo attend un mot de passe. Relancez avec sudo_password = {{{{secret:wsl-sudo-{distro}}}}} (s'il n'est pas encore dans le coffre, ask_secret le fait saisir à l'utilisateur sans que vous le voyiez), demandez wsl_allow_sudo, ou répondez à la session avec wsl_send (input = {{{{secret:wsl-sudo-{distro}}}}}).")
+            } else {
+                "La commande attend une réponse (question, menu, mot de passe) : répondez avec wsl_send (input, ou keys pour un menu plein écran), relisez la suite avec wsl_read, ou arrêtez-la avec wsl_stop.".to_string()
+            });
+        }
+        crate::sessions::FinAtteinte::Delai => {
+            // WSL tue la commande lui-même à `delai` (timeout -k 5) : si l'on
+            // est encore ici, c'est wsl.exe qui est gelé. On coupe plutôt que
+            // de laisser une session fantôme.
+            crate::sessions::stop(&json!({ "session": id })).await.ok();
+            return Err(format!(
+                "WSL n'a pas répondu en {} s",
+                (Duration::from_secs(delai) + MARGE_DEMARRAGE).as_secs()
+            ));
+        }
     }
-    if s.code == Some(124) {
-        r["timed_out"] = json!(true);
-        r["note"] = json!(format!(
-            "Commande interrompue après {delai} s. Pour un serveur ou une tâche longue : `setsid nohup … > ~/journal.log 2>&1 &` puis lisez le journal."
-        ));
+    Ok(rep)
+}
+
+/// La fin de la sortie (déjà nettoyée) ressemble-t-elle à une invitation à
+/// répondre : question, menu, mot de passe ? C'est ce qui rend la main au
+/// modèle dans `wsl_run`, au lieu de le laisser bloqué jusqu'au délai. Jugée
+/// sur la queue, comme un humain qui regarde ce que la commande vient d'écrire.
+pub fn semble_invite(sortie: &str) -> bool {
+    let bas = sortie.to_lowercase();
+    const MOTIFS: &[&str] = &[
+        "[y/n]",
+        "(y/n)",
+        "y/n]",
+        "[yes/no]",
+        "[oui/non]",
+        "<yes>",
+        "[ yes ]",
+        "[ok]",
+        "[ ok ]",
+        "[sudo]",
+        "password for",
+        "a terminal is required",
+        "a password is required",
+        "mot de passe",
+        "press enter",
+        "appuyez sur",
+        "voulez-vous",
+        "do you want",
+        "are you sure",
+        "should ",
+        "(default",
+        "[default",
+    ];
+    let queue: String = bas
+        .chars()
+        .rev()
+        .take(600)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if MOTIFS.iter().any(|m| queue.contains(m)) {
+        return true;
     }
-    Ok(r)
+    // Une question écrite en toutes lettres : la dernière ligne non vide se
+    // termine par « ? », ou ouvre une saisie (« Nom du réseau : »).
+    sortie
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| {
+            let l = l.trim_end();
+            l.ends_with('?') || l.ends_with(':')
+        })
 }
 
 /// WSL glisse ses propres avis dans la sortie d'erreur (« wsl: Failed to
@@ -858,6 +910,34 @@ mod tests {
         assert!(est_windows(r"\\wsl.localhost\Ubuntu\home"));
         assert!(!est_windows("/home/a"));
         assert!(!est_windows("~/projet"));
+    }
+
+    #[test]
+    fn une_invite_rend_la_main_au_modele() {
+        // La question debconf de tshark, telle qu'un terminal la montre.
+        assert!(semble_invite(
+            "│ Should non-superusers be able to capture packets?\n│\n│  <Yes>                       <No>\n"
+        ));
+        assert!(semble_invite("Do you want to continue? [Y/n] "));
+        assert!(semble_invite("Voulez-vous continuer ? [O/n]"));
+        assert!(semble_invite(
+            "Configuration de tshark\n[sudo] password for tealo : "
+        ));
+        assert!(semble_invite("Répertoire d'installation : "));
+        assert!(semble_invite("Press ENTER to continue"));
+        assert!(semble_invite("  [ Ok ]   [ Cancel ]"));
+        // Un dossier de travail, un journal : rien à répondre.
+        assert!(!semble_invite(
+            "total 12\ndrwxr-xr-x 2 tealo 4096 Oct 18 10:00 src\n"
+        ));
+        assert!(!semble_invite("Get:1 http://archive.ubuntu.com/ubuntu jammy/main amd64 [100 kB]\nFetched 100 kB in 1s\n"));
+        assert!(!semble_invite(
+            "Compiling morph v0.1.0\nwarning: unused variable\n"
+        ));
+        // C'est la fin qui compte : une question enterrée loin sous la suite
+        // ne doit pas faire rendre la main.
+        let loin = format!("Continue ? [Y/n]\n{}\n", "ligne de journal\n".repeat(60));
+        assert!(!semble_invite(&loin));
     }
 
     #[test]

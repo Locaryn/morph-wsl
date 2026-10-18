@@ -94,14 +94,42 @@ pub fn nettoyer(brut: &str) -> String {
     sortie
 }
 
+/// Ce qui met fin à l'attente sur une session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinAtteinte {
+    /// Le programme s'est terminé (son code de sortie est rendu).
+    Terminee,
+    /// Il s'est tu sans finir : il attend sans doute une entrée.
+    Invite,
+    /// Le délai de l'appelant est écoulé (le programme peut encore tourner).
+    Delai,
+}
+
 /// Attendre que le programme écrive puis se taise, se termine, ou que le
 /// délai passe ; pendant ce temps, sa sortie part en direct à Locaryn.
 async fn attendre(id: &str, delai: Duration) -> Result<Value, String> {
+    attendre_avec(id, delai, None).await.map(|(v, _)| v)
+}
+
+/// Comme [`attendre`], mais rend aussi compte de la raison du réveil.
+///
+/// `invite`, fourni par `wsl_run`, reçoit la fin de la sortie (nettoyée) :
+/// tant qu'il répond faux, un silence est un simple temps mort et on attend
+/// la fin ou le délai — une compilation peut se taire un moment. S'il répond
+/// vrai, la fin ressemble à une question (« Continue ? [Y/n] », mot de passe,
+/// menu) : le modèle gagne à y répondre avec `wsl_send` plutôt qu'à attendre
+/// que le délai tombe.
+pub(crate) async fn attendre_avec(
+    id: &str,
+    delai: Duration,
+    invite: Option<&dyn Fn(&str) -> bool>,
+) -> Result<(Value, FinAtteinte), String> {
     let debut = Instant::now();
     let mut envoye = {
         let s = sessions().lock().await;
         s.get(id).map(|x| x.lu).ok_or_else(|| inconnue(id))?
     };
+    let fin;
     loop {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let (longueur, fini, vu) = {
@@ -119,18 +147,40 @@ async fn attendre(id: &str, delai: Duration) -> Result<Value, String> {
                 let t = x.tampon.lock().unwrap();
                 String::from_utf8_lossy(&t[envoye.min(t.len())..]).into_owned()
             };
-            crate::mcp::progres(&nettoyer(&nouveau));
+            crate::mcp::progres(&crate::tools::sans_avis_wsl(&nettoyer(&nouveau)));
             envoye = longueur;
         }
-        let a_ecrit = longueur > 0;
-        if fini
-            || debut.elapsed() >= delai
-            || (a_ecrit && vu.elapsed() >= SILENCE && debut.elapsed() >= SILENCE)
-        {
+        if fini {
+            fin = FinAtteinte::Terminee;
             break;
         }
+        if debut.elapsed() >= delai {
+            fin = FinAtteinte::Delai;
+            break;
+        }
+        let a_ecrit = longueur > 0;
+        if a_ecrit && vu.elapsed() >= SILENCE && debut.elapsed() >= SILENCE {
+            let prend = match invite {
+                None => true,
+                Some(f) => {
+                    // La fin de la sortie, telle que le modèle la lira.
+                    let queue = {
+                        let s = sessions().lock().await;
+                        let x = s.get(id).ok_or_else(|| inconnue(id))?;
+                        let t = x.tampon.lock().unwrap();
+                        let debut_queue = t.len().saturating_sub(2_000);
+                        String::from_utf8_lossy(&t[debut_queue..]).into_owned()
+                    };
+                    f(&nettoyer(&queue))
+                }
+            };
+            if prend {
+                fin = FinAtteinte::Invite;
+                break;
+            }
+        }
     }
-    rendre(id).await
+    Ok((rendre(id).await?, fin))
 }
 
 fn inconnue(id: &str) -> String {
@@ -162,13 +212,20 @@ async fn rendre(id: &str) -> Result<Value, String> {
     }
     let fin = x.fin.lock().ok().and_then(|f| *f);
     let silencieux = x.vu.lock().unwrap().elapsed() >= SILENCE;
+    // Les avis de WSL (« wsl: Failed to start the systemd user session… »)
+    // ne viennent pas de la commande : à part, comme dans wsl_run.
+    let propre = nettoyer(&nouveau);
+    let (reste, avis) = crate::tools::separer_avis_wsl(&propre);
     let mut r = json!({
         "session": id,
         "distro": x.distro,
         "command": x.commande,
-        "output": crate::tools::tronque(&nettoyer(&nouveau)),
+        "output": crate::tools::tronque(&reste),
         "running": fin.is_none(),
     });
+    if !avis.is_empty() {
+        r["wsl_notice"] = json!(avis.join("\n"));
+    }
     match fin {
         Some(code) => {
             r["exit_code"] = json!(code);
@@ -197,6 +254,35 @@ pub async fn start(args: &Value) -> Result<Value, String> {
             }));
         }
     }
+    let root = args["as_root"] == json!(true);
+    let distro = crate::wsl::choisir(texte(args, "distro")).await?;
+    let dossier = texte(args, "cwd").filter(|c| !c.trim().is_empty());
+    let id = lancer(
+        commande,
+        distro,
+        dossier,
+        root,
+        texte(args, "sudo_password")
+            .filter(|p| !p.is_empty())
+            .map(str::to_string),
+        VIE_MAX_S,
+    )
+    .await?;
+    attendre(&id, attente(args, 5)).await
+}
+
+/// Lancer une commande dans un pseudo-terminal et rendre l'identifiant de sa
+/// session : le corps commun de `wsl_start` et de `wsl_run`. `delai_s` borne
+/// la commande elle-même (par `timeout -k 5`), pas l'attente de l'appelant :
+/// c'est ce qui laisse une session vivante après un retour de main.
+pub(crate) async fn lancer(
+    commande: &str,
+    distro: String,
+    dossier: Option<&str>,
+    root: bool,
+    mot_de_passe: Option<String>,
+    delai_s: u64,
+) -> Result<String, String> {
     {
         let mut s = sessions().lock().await;
         // Les sessions terminées et déjà relues n'occupent plus de place.
@@ -207,22 +293,28 @@ pub async fn start(args: &Value) -> Result<Value, String> {
             ));
         }
     }
-    let root = args["as_root"] == json!(true);
-    let distro = crate::wsl::choisir(texte(args, "distro")).await?;
-    let dossier = texte(args, "cwd").filter(|c| !c.trim().is_empty());
-    let vie = VIE_MAX_S.to_string();
+    let vie = delai_s.to_string();
     // Un pseudo-terminal quand `script` est là (util-linux, présent sur
     // Ubuntu/Debian/Kali…), sinon un shell simple.
     let lanceur = r#"if command -v script >/dev/null 2>&1; then exec script -qfec "$1" /dev/null; elif command -v bash >/dev/null 2>&1; then exec bash -lc "$1"; else exec sh -lc "$1"; fi"#;
-    let mot_de_passe = texte(args, "sudo_password").filter(|p| !p.is_empty());
-    if mot_de_passe.is_some_and(|p| p.contains("{{secret:")) {
+    if mot_de_passe
+        .as_deref()
+        .is_some_and(|p| p.contains("{{secret:"))
+    {
         return Err(
             "sudo_password n'a pas été rempli par le coffre : mettez Locaryn à jour.".into(),
         );
     }
-    let lancee = match mot_de_passe {
-        Some(_) if crate::tools::utilise_sudo(commande) => crate::tools::prefixe_sudo(commande),
-        _ => commande.to_string(),
+    let avec_sudo = mot_de_passe.is_some() && crate::tools::utilise_sudo(commande);
+    // `stty -echo` d'abord : le pseudo-terminal réaffiche tout ce qu'on lui
+    // écrit, et un mot de passe sudo ne doit jamais revenir dans la sortie.
+    let lancee = if avec_sudo {
+        format!(
+            "stty -echo 2>/dev/null; {}",
+            crate::tools::prefixe_sudo(commande)
+        )
+    } else {
+        commande.to_string()
     };
     let a = crate::wsl::exec_args(
         &distro,
@@ -244,12 +336,7 @@ pub async fn start(args: &Value) -> Result<Value, String> {
     let mut enfant = cmd
         .spawn()
         .map_err(|e| format!("wsl.exe introuvable ({e})"))?;
-    let mut entree = enfant.stdin.take();
-    if let (Some(p), Some(e)) = (mot_de_passe, entree.as_mut()) {
-        if crate::tools::utilise_sudo(commande) {
-            let _ = e.write_all(format!("{p}\n").as_bytes()).await;
-        }
-    }
+    let entree = enfant.stdin.take();
     let tampon = Arc::new(Mutex::new(Vec::new()));
     let vu = Arc::new(Mutex::new(Instant::now()));
     let fin = Arc::new(Mutex::new(None));
@@ -317,7 +404,21 @@ pub async fn start(args: &Value) -> Result<Value, String> {
             }
         });
     }
-    attendre(&id, attente(args, 5)).await
+    // Le mot de passe sudo part une fois le terminal configuré
+    // (`stty -echo` ci-dessus) : écrit plus tôt, le pseudo-terminal le
+    // réafficherait dans la sortie de la commande.
+    if avec_sudo {
+        let p = mot_de_passe.unwrap_or_default();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let mut s = sessions().lock().await;
+        if let Some(x) = s.get_mut(&id) {
+            if let Some(e) = x.entree.as_mut() {
+                let _ = e.write_all(format!("{p}\n").as_bytes()).await;
+                let _ = e.flush().await;
+            }
+        }
+    }
+    Ok(id)
 }
 
 fn rand_id() -> String {
